@@ -4,41 +4,44 @@ import time
 import pika
 import serial
 import glob
+import queue
 
-# ==== FUNCIÓN PARA DETECTAR EL PUERTO ====
+# ==== DETECT SERIAL PORT ====
 def detectar_puerto():
     posibles_puertos = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*')
     if posibles_puertos:
-        print(f"✅ Puerto detectado: {posibles_puertos[0]}")
+        print(f"✅ Detected port: {posibles_puertos[0]}")
         return posibles_puertos[0]
     else:
-        print("❌ No se encontró el Arduino.")
+        print("❌ Arduino not found.")
         exit()
 
-# ==== CONFIGURACIÓN ====
+# ==== CONFIG ====
 PUERTO_SERIAL = detectar_puerto()
 BAUDIOS = 9600
 
 URL_AMQP = "amqps://oxwjrchs:RHg5HbbZUYwbFadZzjkQ2l3AYcVPCda7@gull.rmq.cloudamqp.com/oxwjrchs"
 EXCHANGE = "sensor_exchange"
 COLA_SENSORES = "cola_sensores"
+COLA_SENSORES_AVG = "cola_sensores_average"
 COLA_BOMBAS = "cola_bombas"
 COLA_RESPUESTAS = "cola_respuestas"
 
-# ==== CONEXIÓN SERIAL ====
+# ==== SERIAL CONNECTION ====
 try:
     arduino = serial.Serial(PUERTO_SERIAL, BAUDIOS, timeout=1)
     time.sleep(2)
-    print(f"✅ Conectado a {PUERTO_SERIAL}")
+    print(f"✅ Connected to {PUERTO_SERIAL}")
 except Exception as e:
-    print(f"❌ Error al conectar al puerto serial: {e}")
+    print(f"❌ Serial connection error: {e}")
     exit()
 
-# ==== CONEXIONES RABBITMQ ====
+# ==== RABBITMQ CONNECTIONS ====
 try:
     conexion_lectura = pika.BlockingConnection(pika.URLParameters(URL_AMQP))
     canal_lectura = conexion_lectura.channel()
     canal_lectura.queue_declare(queue=COLA_SENSORES, durable=True)
+    canal_lectura.queue_declare(queue=COLA_SENSORES_AVG, durable=True)
 
     conexion_comandos = pika.BlockingConnection(pika.URLParameters(URL_AMQP))
     canal_comandos = conexion_comandos.channel()
@@ -48,11 +51,13 @@ try:
     canal_respuestas = conexion_respuestas.channel()
     canal_respuestas.queue_declare(queue=COLA_RESPUESTAS, durable=True)
 except Exception as e:
-    print(f"❌ Error al conectar a RabbitMQ: {e}")
+    print(f"❌ RabbitMQ connection error: {e}")
     exit()
 
-# ==== FUNCIONES ====
+# ==== COLA DE COMANDOS ====
+cola_comandos_serial = queue.Queue()
 
+# ==== PUBLISH FUNCTIONS ====
 def enviar_lectura_a_rabbit(msg_json):
     try:
         canal_lectura.basic_publish(
@@ -61,9 +66,21 @@ def enviar_lectura_a_rabbit(msg_json):
             body=json.dumps(msg_json),
             properties=pika.BasicProperties(delivery_mode=2)
         )
-        print(f"📤 Enviado a {COLA_SENSORES}: {msg_json}")
+        print(f"📤 Sent to {COLA_SENSORES}: {msg_json}")
     except Exception as e:
-        print(f"❌ Error al enviar mensaje: {e}")
+        print(f"❌ Error sending message: {e}")
+
+def enviar_lectura_average(msg_json):
+    try:
+        canal_lectura.basic_publish(
+            exchange=EXCHANGE,
+            routing_key="sensor.average",
+            body=json.dumps(msg_json),
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        print(f"📤 Sent to {COLA_SENSORES_AVG}: {msg_json}")
+    except Exception as e:
+        print(f"❌ Error sending average message: {e}")
 
 def enviar_respuesta_bomba(msg_json):
     try:
@@ -73,59 +90,82 @@ def enviar_respuesta_bomba(msg_json):
             body=json.dumps(msg_json),
             properties=pika.BasicProperties(delivery_mode=2)
         )
-        print(f"📤 Respuesta enviada a {COLA_RESPUESTAS}: {msg_json}")
+        print(f"📤 Pump response sent to {COLA_RESPUESTAS}: {msg_json}")
     except Exception as e:
-        print(f"❌ Error al enviar respuesta de bomba: {e}")
+        print(f"❌ Error sending pump response: {e}")
 
-def escuchar_serial():
-    buffer = []
-    ultimo_envio = time.time()
-
+# ==== THREAD: SERIAL COMMAND PROCESSOR ====
+def procesador_de_comandos_serial():
     while True:
+        comando, tipo_esperado = cola_comandos_serial.get()
         try:
-            if arduino.in_waiting:
-                linea = arduino.readline().decode(errors='ignore').strip()
-                if linea:
-                    try:
-                        data = json.loads(linea)
-                        # Clasifica si es lectura de sensor o respuesta de bomba
-                        if isinstance(data, dict) and "accion" in data:
-                            enviar_respuesta_bomba(data)
-                        else:
-                            buffer.append(data)
-                    except json.JSONDecodeError:
-                        print(f"⚠ Línea ignorada (no es JSON válido): {linea}")
+            arduino.reset_input_buffer()
+            arduino.write((comando + "\n").encode())
+            print(f"📲 Sent to Arduino: {comando}")
 
-            # Si han pasado 10 segundos, envía el lote de lecturas
-            if time.time() - ultimo_envio >= 10:
-                for lectura in buffer:
+            respuestas = {}
+            start_time = time.time()
+            while time.time() - start_time < 6:
+                if arduino.in_waiting:
+                    linea = arduino.readline().decode(errors='ignore').strip()
+                    if linea:
+                        try:
+                            data = json.loads(linea)
+                            if isinstance(data, dict):
+                                if "accion" in data:
+                                    enviar_respuesta_bomba(data)
+                                elif tipo_esperado == "average" and data.get("tipo") == "average":
+                                    enviar_lectura_average(data)
+                                elif tipo_esperado == "realtime" and data.get("sensorId"):
+                                    respuestas[data["sensorId"]] = data
+                                    if len(respuestas) >= 20:
+                                        break
+                        except json.JSONDecodeError:
+                            print(f"⚠ Invalid JSON: {linea}")
+
+            if tipo_esperado == "realtime":
+                for lectura in respuestas.values():
                     enviar_lectura_a_rabbit(lectura)
-                buffer.clear()
-                ultimo_envio = time.time()
 
         except Exception as e:
-            print(f"❌ Error en lectura serial: {e}")
-            break
+            print(f"❌ Error processing command '{comando}': {e}")
+        cola_comandos_serial.task_done()
 
+# ==== THREAD: ESCUCHAR COMANDOS BOMBA ====
 def escuchar_comandos():
     def callback(ch, method, properties, body):
         comando = body.decode().strip()
-        print(f"📥 Comando recibido: {comando}")
-        try:
-            arduino.write((comando + "\n").encode())
-        except Exception as e:
-            print(f"❌ Error al enviar comando al Arduino: {e}")
+        print(f"📥 Command received: {comando}")
+        cola_comandos_serial.put((comando, "pump"))
 
     try:
         canal_comandos.basic_consume(queue=COLA_BOMBAS, on_message_callback=callback, auto_ack=True)
-        print("🎧 Escuchando comandos desde cola_bombas...")
+        print("🎧 Listening to bomba commands...")
         canal_comandos.start_consuming()
     except Exception as e:
-        print(f"❌ Error al consumir mensajes: {e}")
+        print(f"❌ Error consuming bomba commands: {e}")
 
-# ==== INICIAR HEBRAS ====
-h1 = threading.Thread(target=escuchar_serial)
-h2 = threading.Thread(target=escuchar_comandos)
+# ==== THREAD: SOLICITAR CADA 30 MIN ====
+def leer_y_enviar_30min():
+    while True:
+        print("⏳ Scheduled 30-min request")
+        cola_comandos_serial.put(("get_all_now", "average"))
+        time.sleep(1800)
 
-h1.start()
-h2.start()
+# ==== THREAD: SOLICITAR CADA 15 SEG ====
+def leer_y_enviar_realtime():
+    while True:
+        print("⏱ Scheduled 15-sec realtime request")
+        cola_comandos_serial.put(("get_realtime_now", "realtime"))
+        time.sleep(15)
+
+# ==== START THREADS ====
+th1 = threading.Thread(target=procesador_de_comandos_serial)
+th2 = threading.Thread(target=escuchar_comandos)
+th3 = threading.Thread(target=leer_y_enviar_30min)
+th4 = threading.Thread(target=leer_y_enviar_realtime)
+
+th1.start()
+th2.start()
+th3.start()
+th4.start()
