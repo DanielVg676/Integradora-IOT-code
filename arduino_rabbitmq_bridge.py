@@ -18,7 +18,7 @@ def detectar_puerto():
 
 # ==== CONFIG ====
 PUERTO_SERIAL = detectar_puerto()
-BAUDIOS = 9600
+BAUDIOS = 1000000  # Cambiado a 115200 para mayor velocidad
 
 URL_AMQP = "amqps://oxwjrchs:RHg5HbbZUYwbFadZzjkQ2l3AYcVPCda7@gull.rmq.cloudamqp.com/oxwjrchs"
 EXCHANGE = "sensor_exchange"
@@ -82,7 +82,9 @@ def enviar_lectura_average(msg_json):
     except Exception as e:
         print(f"❌ Error sending average message: {e}")
 
+# ==== FUNCIÓN ACTUALIZADA: ENVIAR RESPUESTA BOMBA (con reconexión) ====
 def enviar_respuesta_bomba(msg_json):
+    global canal_respuestas, conexion_respuestas
     try:
         canal_respuestas.basic_publish(
             exchange=EXCHANGE,
@@ -93,6 +95,41 @@ def enviar_respuesta_bomba(msg_json):
         print(f"📤 Pump response sent to {COLA_RESPUESTAS}: {msg_json}")
     except Exception as e:
         print(f"❌ Error sending pump response: {e}")
+        try:
+            print("🔄 Reconnecting canal_respuestas...")
+            conexion_respuestas = pika.BlockingConnection(pika.URLParameters(URL_AMQP))
+            canal_respuestas = conexion_respuestas.channel()
+            canal_respuestas.queue_declare(queue=COLA_RESPUESTAS, durable=True)
+            # Retry after reconnection
+            canal_respuestas.basic_publish(
+                exchange=EXCHANGE,
+                routing_key="bomba.respuesta",
+                body=json.dumps(msg_json),
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+            print(f"✅ Retried and sent after reconnection: {msg_json}")
+        except Exception as e2:
+            print(f"❌ Reconnection failed: {e2}")
+
+# ==== NUEVO THREAD: PING CADA 9 MINUTOS PARA MANTENER CONEXIÓN ====
+def mantener_viva_respuesta():
+    while True:
+        try:
+            ping = {
+                "accion": "ping",
+                "status": "ok",
+                "mensaje": "mantener viva conexión"
+            }
+            canal_respuestas.basic_publish(
+                exchange=EXCHANGE,
+                routing_key="bomba.respuesta",
+                body=json.dumps(ping),
+                properties=pika.BasicProperties(delivery_mode=1)
+            )
+            print("🟢 Ping enviado a canal_respuestas")
+        except Exception as e:
+            print(f"⚠ Error enviando ping: {e}")
+        time.sleep(540)  # 9 minutos
 
 # ==== THREAD: SERIAL COMMAND PROCESSOR ====
 def procesador_de_comandos_serial():
@@ -105,6 +142,7 @@ def procesador_de_comandos_serial():
 
             respuestas = {}
             start_time = time.time()
+
             while time.time() - start_time < 6:
                 if arduino.in_waiting:
                     linea = arduino.readline().decode(errors='ignore').strip()
@@ -114,6 +152,9 @@ def procesador_de_comandos_serial():
                             if isinstance(data, dict):
                                 if "accion" in data:
                                     enviar_respuesta_bomba(data)
+                                    # Si es comando de bomba, ya no necesitamos seguir leyendo
+                                    if tipo_esperado == "pump":
+                                        break
                                 elif tipo_esperado == "average" and data.get("tipo") == "average":
                                     enviar_lectura_average(data)
                                 elif tipo_esperado == "realtime" and data.get("sensorId"):
@@ -150,22 +191,29 @@ def leer_y_enviar_30min():
     while True:
         print("⏳ Scheduled 30-min request")
         cola_comandos_serial.put(("get_all_now", "average"))
-        time.sleep(1800)
+        time.sleep(1790)
+
+
+# ==== 1790 ====
 
 # ==== THREAD: SOLICITAR CADA 15 SEG ====
 def leer_y_enviar_realtime():
     while True:
         print("⏱ Scheduled 15-sec realtime request")
         cola_comandos_serial.put(("get_realtime_now", "realtime"))
-        time.sleep(15)
+        time.sleep(20)
 
 # ==== START THREADS ====
 th1 = threading.Thread(target=procesador_de_comandos_serial)
 th2 = threading.Thread(target=escuchar_comandos)
 th3 = threading.Thread(target=leer_y_enviar_30min)
 th4 = threading.Thread(target=leer_y_enviar_realtime)
+th5 = threading.Thread(target=mantener_viva_respuesta)
 
 th1.start()
 th2.start()
 th3.start()
 th4.start()
+th5.start()
+
+
